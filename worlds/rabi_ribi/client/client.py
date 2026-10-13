@@ -18,7 +18,16 @@ from CommonClient import (
 from NetUtils import ClientStatus, NetworkItem
 
 from worlds.AutoWorld import World
-from ..client.memory_io import RabiRibiMemoryIO
+import sys
+
+if sys.platform == "win32":
+    from ..client.memory_io import RabiRibiMemoryIO
+elif sys.platform.startswith("linux"):
+    from ..client.memory_io_linux import RabiRibiMemoryIO
+else:
+    raise RuntimeError(
+        f"Rabi-Ribi memory access is not supported on {sys.platform}"
+    )
 from ..constants import GAME_NAME
 from ..data import data
 from ..items import item_groups
