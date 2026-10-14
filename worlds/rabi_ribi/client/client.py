@@ -185,6 +185,7 @@ class RabiRibiContext(TrackerGameContext): # type: ignore
                 }]))
 
         if cmd == "ReceivedItems":
+            logger.warning("LINUX DEBUG: ReceivedItems message received")
             asyncio.create_task(self.set_received_rabi_ribi_item_ids())
 
         if cmd == "RoomInfo":
@@ -221,6 +222,13 @@ class RabiRibiContext(TrackerGameContext): # type: ignore
             return
 
         logger.info("Waiting for connect from server...")
+        logger.warning(
+            "LINUX DEBUG: initial data gate; custom_seed_subdir=%r slot=%r "
+            "slot_data=%r",
+            self.custom_seed_subdir,
+            self.slot,
+            bool(self.slot_data),
+        )
         while not self.client_recieved_initial_server_data() and not self.exit_event.is_set():
             await asyncio.sleep(1)
         if not self.exit_event.is_set():
@@ -263,7 +271,16 @@ class RabiRibiContext(TrackerGameContext): # type: ignore
         if cur_item_id > 0:
             already_has_item = self.rr_interface.does_player_have_item_id(cur_item_id)
             if not already_has_item:
-                self.rr_interface.give_item(cur_item_id)
+                print(
+                    f"[Linux item debug] attempting item ID {cur_item_id}",
+                    flush=True,
+                )
+                self.rr_interface.give_item(cur_item_id)                
+                print(
+                    f"[Linux item debug] give_item returned for ID {cur_item_id}",
+                    flush=True,
+                )
+
             # Update index regardless to move to the next item in the queue
             self.rr_interface.set_last_received_item_index(last_received_item_index + skipped_items + 1)
             if not already_has_item:
@@ -274,6 +291,10 @@ class RabiRibiContext(TrackerGameContext): # type: ignore
             self.rr_interface.set_last_received_item_index(last_received_item_index + len(remaining_items))
 
     async def set_received_rabi_ribi_item_ids(self):
+        logger.warning(
+            "LINUX DEBUG: processing received items; count=%s",
+            len(self.items_received),
+        )
         async with self.critical_section_lock:
             self.items_received_rabi_ribi_ids = []
             #  Subtract 30 since those are reserved for shop and super / hyper attack modes
@@ -301,6 +322,11 @@ class RabiRibiContext(TrackerGameContext): # type: ignore
                 else:
                     self.items_received_rabi_ribi_ids.append(
                         int(data.get_item_by_ap_name(item_name).id))
+            logger.warning(
+                "LINUX DEBUG: item queue built; queued_ids=%s ids=%s",
+                len(self.items_received_rabi_ribi_ids),
+                self.items_received_rabi_ribi_ids,
+            )
 
     def is_item_queued(self):
         """
@@ -600,8 +626,17 @@ async def rabi_ribi_watcher(ctx: RabiRibiContext):
 
     :RabiRibiContext ctx: The Rabi Ribi Client context instance.
     """
+    logger.warning("LINUX DEBUG: watcher entered")
     watch_menu_task = None
+
+    logger.warning("LINUX DEBUG: waiting for initial connection info")
     await ctx.wait_for_initial_connection_info()
+    logger.warning("LINUX DEBUG: initial connection info received")
+    logger.warning(
+        "LINUX DEBUG: watcher past initial wait; slot=%r seed_player_id=%r",
+        ctx.slot,
+        ctx.seed_player_id,
+    )
     while not ctx.exit_event.is_set():
         if not ctx.server:
             # client disconnected from server
@@ -631,7 +666,9 @@ async def rabi_ribi_watcher(ctx: RabiRibiContext):
                 break
             if not ctx.server:
                 continue
+            logger.warning("LINUX DEBUG: before wait_until_out_of_shaft")
             await ctx.wait_until_out_of_shaft()
+            logger.warning("LINUX DEBUG: after wait_until_out_of_shaft")
 
             cur_time = time.time()
 
@@ -646,15 +683,31 @@ async def rabi_ribi_watcher(ctx: RabiRibiContext):
                 ctx.time_since_last_death = time.time()
                 await ctx.send_death(f"{ctx.player_names[ctx.slot]} was defeated...")
 
+            logger.warning("LINUX DEBUG: before handle_egg_changes")
             await ctx.handle_egg_changes()
+            logger.warning("LINUX DEBUG: after handle_egg_changes")
 
+            logger.warning("LINUX DEBUG: before check_for_locations")
             await check_for_locations(ctx)
+            logger.warning("LINUX DEBUG: after check_for_locations")
             await ctx.update_player_location()
 
             if ctx.in_state_where_should_open_warp_menu():
                 ctx.open_warp_menu()
 
-            if ctx.in_state_where_can_give_items():
+            logger.warning(
+                "LINUX DEBUG watcher reached; queued_ids=%s received_items=%s",
+                len(ctx.items_received_rabi_ribi_ids),
+                len(ctx.items_received),
+            )
+            can_give = ctx.in_state_where_can_give_items()
+            logger.warning(
+                "LINUX DEBUG: watcher checkpoint; can_give=%s queued_ids=%s last_index=%s",
+                can_give,
+                len(ctx.items_received_rabi_ribi_ids),
+                ctx.rr_interface.get_last_received_item_index(),
+            )
+            if can_give:
                 await ctx.give_item()
 
             ctx.handle_consumable_changes()
@@ -742,9 +795,15 @@ async def main(args):
         ctx.run_gui()
     ctx.run_cli()
 
+    logger.warning("LINUX DEBUG: scheduling Rabi-Ribi watcher")
     watcher = asyncio.create_task(
         rabi_ribi_watcher(ctx),
         name="Rabi-Ribi Progression Watcher"
+    )
+    logger.warning(
+        "LINUX DEBUG: watcher scheduled; done=%s cancelled=%s",
+        watcher.done(),
+        watcher.cancelled(),
     )
     await ctx.exit_event.wait()
     await watcher

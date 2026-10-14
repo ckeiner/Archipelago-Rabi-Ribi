@@ -1,15 +1,15 @@
-
 """Linux memory backend for Rabi-Ribi running under Wine/Proton.
 
-Memory reads and writes use /proc/<pid>/mem.
-Remote allocation and item injection are not implemented yet.
+Memory reads and writes use a restricted privileged helper to access
+/proc/<pid>/mem. Remote allocation and item injection are not implemented.
 """
+
 import asyncio
-import os
 import struct
 from pathlib import Path
 
 from CommonClient import logger
+from .privileged_game_memory import PrivilegedGameMemory
 
 
 # Keep these offsets synchronized with memory_io.py.
@@ -40,26 +40,30 @@ EVENT_FLAG_ID_START = 255
 TILE_LENGTH = 64
 EGG_ARRAY_LENGTH = 80 * 3 * 2
 
+# Items whose basic inventory state can be tested without invoking game code.
+# Multi-level upgrades and items with special handling are intentionally excluded.
+# DIRECT_INVENTORY_ITEM_IDS = frozenset({
+#     2, 5, 9, 10, 12, 13, 14, 22, 24, 25, 26, 27, 29, 31, 35,
+#     *range(64, 95),
+# })
+
+
 
 class ProcessNotFound(Exception):
-    pass
+    """Raised when the Rabi-Ribi process cannot be found."""
 
 
 class ProcessError(Exception):
-    pass
+    """Raised when accessing the target process fails."""
 
 
 class LinuxProcessMemory:
-    """Basic memory access for a Linux process."""
+    """Memory access to a Linux process through the privileged helper."""
 
     def __init__(self, pid: int, base_address: int):
         self.process_id = pid
         self.base_address = base_address
-        self._fd = os.open(
-            f"/proc/{pid}/mem",
-            os.O_RDWR | os.O_CLOEXEC,
-        )
-
+        self._helper = PrivilegedGameMemory(pid)
 
     @staticmethod
     def _find_pid(name: str) -> int:
@@ -84,14 +88,16 @@ class LinuxProcessMemory:
                     for part in raw.split(b"\0")
                     if part
                 ]
-                if any(Path(arg.replace("\\", "/")).name.casefold() == wanted
-                       for arg in args):
+
+                if any(
+                    Path(arg.replace("\\", "/")).name.casefold() == wanted
+                    for arg in args
+                ):
                     candidates.append(pid)
             except OSError:
                 continue
 
-        # Check candidates in reverse order because the actual game process
-        # is often newer than Steam's Proton launcher processes.
+        # The actual game process is often newer than the launcher process.
         for pid in reversed(candidates):
             try:
                 LinuxProcessMemory._find_base(pid, name)
@@ -103,23 +109,28 @@ class LinuxProcessMemory:
         for entry in entries:
             if not entry.name.isdecimal():
                 continue
+
             try:
-                LinuxProcessMemory._find_base(int(entry.name), name)
-                return int(entry.name)
+                pid = int(entry.name)
+                LinuxProcessMemory._find_base(pid, name)
+                return pid
             except (ProcessError, OSError):
                 continue
 
-        raise ProcessNotFound(f"Could not find a mapped process for {name}")
-
+        raise ProcessNotFound(
+            f"Could not find a mapped process for {name}"
+        )
 
     @staticmethod
     def _find_base(pid: int, name: str) -> int:
-        """Find the lowest mapping backed by the target executable."""
+        """Find the image base from the executable's file-backed mappings."""
         maps_path = Path(f"/proc/{pid}/maps")
         matches = []
 
         try:
-            for line in maps_path.read_text(errors="replace").splitlines():
+            for line in maps_path.read_text(
+                errors="replace"
+            ).splitlines():
                 parts = line.split(maxsplit=5)
                 if len(parts) < 6:
                     continue
@@ -131,8 +142,6 @@ class LinuxProcessMemory:
                 start_text, _end_text = parts[0].split("-", 1)
                 file_offset = int(parts[2], 16)
 
-                # The image base is the beginning of the executable's
-                # file-backed mapping at file offset zero.
                 if file_offset == 0:
                     matches.append(int(start_text, 16))
 
@@ -157,11 +166,8 @@ class LinuxProcessMemory:
     def _check_alive(self):
         if not Path(f"/proc/{self.process_id}").exists():
             raise ProcessError(f"Process {self.process_id} exited")
-    
 
     def _validate_range(self, address: int, length: int):
-        if self._fd is None:
-            raise ProcessError("Process memory handle is closed")
         if not isinstance(address, int) or not isinstance(length, int):
             raise TypeError("Address and length must be integers")
         if address < 0 or length < 0:
@@ -169,34 +175,24 @@ class LinuxProcessMemory:
         if address + length > 0x1_0000_0000:
             raise ValueError("Range exceeds the 32-bit address space")
 
+        self._check_alive()
 
     def read_bytes(self, address: int, length: int) -> bytes:
-        self._check_alive()
         self._validate_range(address, length)
         try:
-            data = os.pread(self._fd, length, address)
-        except OSError as exc:
-            raise ProcessError(f"Memory read failed at {address:#x}: {exc}") from exc
-        if len(data) != length:
-            raise ProcessError(
-                f"Short read at {address:#x}: wanted {length}, got {len(data)}"
-            )
-        return data
+            return self._helper.read_bytes(address, length)
+        except (OSError, RuntimeError, BrokenPipeError) as exc:
+            raise ProcessError(f"Memory read failed: {exc}") from exc
 
-    def write_bytes(self, address: int, value: bytes, length=None):
-        if length is not None:
-            if length != len(value):
-                raise ValueError("length must match the byte buffer length")
-            self._validate_range(address, length)
-        else:
-            self._validate_range(address, len(value))
-        self._check_alive()
+    def write_bytes(self, address: int, data: bytes) -> None:
+        if not isinstance(data, bytes):
+            raise TypeError("data must be bytes")
+
+        self._validate_range(address, len(data))
         try:
-            written = os.pwrite(self._fd, value, address)
-        except OSError as exc:
-            raise ProcessError(f"Memory write failed at {address:#x}: {exc}") from exc
-        if written != len(value):
-            raise ProcessError(f"Short memory write at {address:#x}")
+            self._helper.write_bytes(address, data)
+        except (OSError, RuntimeError, BrokenPipeError) as exc:
+            raise ProcessError(f"Memory write failed: {exc}") from exc
 
     def read_short(self, address: int) -> int:
         return struct.unpack("<h", self.read_bytes(address, 2))[0]
@@ -204,13 +200,20 @@ class LinuxProcessMemory:
     def write_short(self, address: int, value: int):
         self.write_bytes(address, struct.pack("<h", value))
 
+    def read_int(self, address: int) -> int:
+        return struct.unpack("<i", self.read_bytes(address, 4))[0]
+
     def write_int(self, address: int, value: int):
         self.write_bytes(address, struct.pack("<i", value))
 
     def close(self):
-        if self._fd is not None:
-            os.close(self._fd)
-            self._fd = None
+        helper = getattr(self, "_helper", None)
+        if helper is not None:
+            self._helper = None
+            try:
+                helper.close()
+            except (OSError, RuntimeError):
+                pass
 
 
 class RabiRibiMemoryIO:
@@ -225,8 +228,9 @@ class RabiRibiMemoryIO:
         if self.rr_mem is not None:
             try:
                 self.rr_mem.close()
-            except OSError:
+            except (OSError, ProcessError):
                 pass
+
         self.rr_mem = None
         self.rr_process_id = None
         self.addr_injected_give_item_entrypoint = None
@@ -234,31 +238,36 @@ class RabiRibiMemoryIO:
     def is_connected(self):
         if self.rr_mem is None:
             return False
+
         try:
             self._read_int(OFFSET_AREA_ID)
             return True
-        except (ProcessError, OSError):
+        except (ProcessError, OSError, RuntimeError):
             logger.info("Lost connection with Rabi Ribi game.")
             self._disconnect()
             return False
 
     async def connect(self, exit_event: asyncio.Event):
         logger.info("Waiting for connection to Rabi Ribi game instance...")
+
         while not exit_event.is_set():
             try:
                 self.rr_mem = LinuxProcessMemory.open_process_from_name(
                     "rabiribi.exe"
                 )
                 self.rr_process_id = self.rr_mem.process_id
+
                 logger.info(
                     "Connected to Rabi Ribi (PID %s, base %s).",
                     self.rr_process_id,
                     hex(self.rr_mem.base_address),
                 )
                 return
+
             except ProcessNotFound:
                 await asyncio.sleep(3)
-            except (PermissionError, OSError, ProcessError) as exc:
+
+            except (PermissionError, OSError, ProcessError, RuntimeError) as exc:
                 self._disconnect()
                 logger.warning("Cannot attach to Rabi Ribi: %s", exc)
                 await asyncio.sleep(3)
@@ -269,18 +278,24 @@ class RabiRibiMemoryIO:
         )
 
     def _read_word(self, offset):
-        return self.rr_mem.read_bytes(self.rr_mem.base_address + offset, 4)
+        return self.rr_mem.read_bytes(
+            self.rr_mem.base_address + offset, 4
+        )
 
     def _read_short(self, offset):
-        return self.rr_mem.read_bytes(self.rr_mem.base_address + offset, 2)
+        return self.rr_mem.read_bytes(
+            self.rr_mem.base_address + offset, 2
+        )
 
     def _read_byte(self, offset):
-        return self.rr_mem.read_bytes(self.rr_mem.base_address + offset, 1)
+        return self.rr_mem.read_bytes(
+            self.rr_mem.base_address + offset, 1
+        )
 
     def _read_string(self, offset, length):
         return self.rr_mem.read_bytes(
             self.rr_mem.base_address + offset, length
-        ).decode("utf-8")
+        ).decode("utf-8", errors="replace")
 
     def _read_float(self, offset):
         return struct.unpack("<f", self._read_word(offset))[0]
@@ -295,7 +310,9 @@ class RabiRibiMemoryIO:
         return struct.unpack("<?", self._read_byte(offset))[0]
 
     def _read_4_byte_bool_raw(self, address):
-        return struct.unpack("<i", self.rr_mem.read_bytes(address, 4))[0] != 0
+        return struct.unpack(
+            "<i", self.rr_mem.read_bytes(address, 4)
+        )[0] != 0
 
     def read_player_tile_position(self):
         area_id = self._read_int(OFFSET_AREA_ID)
@@ -328,16 +345,81 @@ class RabiRibiMemoryIO:
             for y in range(-1, 2)
         )
 
-    def give_item(self, item_id):
-        raise NotImplementedError(
-            "Linux item injection is not implemented; no item was delivered."
+
+    def give_item(self, item_id: int):
+        """Give an item through the game's native x86 function.
+
+        Memory access is available on Linux, but calling the 32-bit game
+        function requires a Wine-aware guest execution backend.
+        """
+        if not isinstance(item_id, int) or isinstance(item_id, bool):
+            raise TypeError("item_id must be an integer")
+
+        if not 0 <= item_id <= 0x7FFFFFFF:
+            raise ValueError(f"Invalid item ID: {item_id}")
+
+        if self.rr_mem is None:
+            raise ProcessError("Not connected to Rabi-Ribi.")
+
+        function_address = (
+            self.rr_mem.base_address + OFFSET_GIVE_ITEM_FUNC
+        )
+        function_bytes = self.rr_mem.read_bytes(function_address, 16)
+
+        expected_prologue = bytes.fromhex(
+            "55 8b ec 83 ec 0c 83 3d 14 4a c8 00 00 53 56 8b"
+        )
+        if function_bytes != expected_prologue:
+            raise ProcessError(
+                "give_item target does not match the expected game function; "
+                "refusing to execute an unverified address."
+            )
+
+
+        # if item_id not in DIRECT_INVENTORY_ITEM_IDS:
+        #     raise NotImplementedError(
+        #         f"Item ID {item_id} is not supported by the Linux "
+        #         "direct-inventory fallback. No item was delivered."
+        #     )
+
+        # Don't overwrite an existing state (including upgraded or disabled
+        # states). The client normally checks ownership before calling us.
+        current_state = self.get_item_state(item_id)
+        if current_state != 0:
+            raise ProcessError(
+                f"Item ID {item_id} already has inventory state "
+                f"{current_state}; refusing to overwrite it."
+            )
+
+        self.set_item_state(item_id, 1)
+
+        print(
+            f"[Linux item debug] item={item_id}, "
+            f"state_after_write={self.get_item_state(item_id)}, "
+            f"has_item={self.does_player_have_item_id(item_id)}",
+            flush=True,
         )
 
-    def remove_exclamation_point_from_in_memory_map(self, area_id, x, y):
+
+        # Verify the write before returning success to the receive loop.
+        actual_state = self.get_item_state(item_id)
+        if actual_state != 1:
+            raise ProcessError(
+                f"Inventory write for item ID {item_id} did not verify "
+                f"(read back {actual_state})."
+            )
+        return
+
+
+    def remove_exclamation_point_from_in_memory_map(
+        self, area_id, x, y
+    ):
         address = (
-            self.rr_mem.base_address + OFFSET_ITEM_MAP
+            self.rr_mem.base_address
+            + OFFSET_ITEM_MAP
             + ((x * 200 + y) * 2)
         )
+
         if self.rr_mem.read_short(address) == EXCLAMATION_POINT_ITEM_ID:
             self.rr_mem.write_short(address, 0)
 
@@ -350,11 +432,14 @@ class RabiRibiMemoryIO:
         )
 
     def get_item_state(self, item_id) -> int:
-        return self._read_int(OFFSET_INVENTORY_START + 4 * int(item_id))
+        return self._read_int(
+            OFFSET_INVENTORY_START + 4 * int(item_id)
+        )
 
     def set_item_state(self, item_id, state):
         self.rr_mem.write_int(
-            self.rr_mem.base_address + OFFSET_INVENTORY_START
+            self.rr_mem.base_address
+            + OFFSET_INVENTORY_START
             + 4 * int(item_id),
             state,
         )
@@ -367,7 +452,8 @@ class RabiRibiMemoryIO:
 
     def set_event_state(self, event_id: int, state: bool):
         address = (
-            self.rr_mem.base_address + OFFSET_EVENT_START
+            self.rr_mem.base_address
+            + OFFSET_EVENT_START
             + 4 * (event_id - EVENT_FLAG_ID_START)
         )
         self.rr_mem.write_int(address, 1 if state else 0)
@@ -383,8 +469,10 @@ class RabiRibiMemoryIO:
             EGG_ARRAY_LENGTH,
         )
         eggs = list(struct.iter_unpack("<3h", data))
+
         if (0, 0, 0) in eggs:
             eggs = eggs[:eggs.index((0, 0, 0))]
+
         return eggs
 
     def get_number_of_eggs_collected(self) -> int:
