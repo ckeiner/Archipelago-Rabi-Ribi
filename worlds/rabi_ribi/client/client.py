@@ -185,7 +185,6 @@ class RabiRibiContext(TrackerGameContext): # type: ignore
                 }]))
 
         if cmd == "ReceivedItems":
-            logger.warning("LINUX DEBUG: ReceivedItems message received")
             asyncio.create_task(self.set_received_rabi_ribi_item_ids())
 
         if cmd == "RoomInfo":
@@ -222,13 +221,6 @@ class RabiRibiContext(TrackerGameContext): # type: ignore
             return
 
         logger.info("Waiting for connect from server...")
-        logger.warning(
-            "LINUX DEBUG: initial data gate; custom_seed_subdir=%r slot=%r "
-            "slot_data=%r",
-            self.custom_seed_subdir,
-            self.slot,
-            bool(self.slot_data),
-        )
         while not self.client_recieved_initial_server_data() and not self.exit_event.is_set():
             await asyncio.sleep(1)
         if not self.exit_event.is_set():
@@ -289,11 +281,6 @@ class RabiRibiContext(TrackerGameContext): # type: ignore
             max_level = 1 + item.max_upgrades
 
             if current_level < max_level:
-                print(
-                    f"[Linux item debug] attempting item ID {cur_item_id}; "
-                    f"state={current_state}, max={max_level}",
-                    flush=True,
-                )
                 self.rr_interface.give_item(cur_item_id)
                 await asyncio.sleep(1)
                 await self.wait_until_out_of_item_receive_animation()
@@ -310,10 +297,6 @@ class RabiRibiContext(TrackerGameContext): # type: ignore
 
 
     async def set_received_rabi_ribi_item_ids(self):
-        logger.warning(
-            "LINUX DEBUG: processing received items; count=%s",
-            len(self.items_received),
-        )
         async with self.critical_section_lock:
             self.items_received_rabi_ribi_ids = []
             #  Subtract 30 since those are reserved for shop and super / hyper attack modes
@@ -341,11 +324,6 @@ class RabiRibiContext(TrackerGameContext): # type: ignore
                 else:
                     self.items_received_rabi_ribi_ids.append(
                         int(data.get_item_by_ap_name(item_name).id))
-            logger.warning(
-                "LINUX DEBUG: item queue built; queued_ids=%s ids=%s",
-                len(self.items_received_rabi_ribi_ids),
-                self.items_received_rabi_ribi_ids,
-            )
 
     def is_item_queued(self):
         """
@@ -405,6 +383,11 @@ class RabiRibiContext(TrackerGameContext): # type: ignore
 
     async def update_player_location(self):
         area_id, x, y = self.rr_interface.read_player_tile_position()
+        logger.warning(
+            "LINUX MAP DEBUG: area=%s tile=(%s,%s) "
+            "previous_area=%s previous_room=%s",
+            area_id, x, y, self.current_area_id, self.current_room,
+        )
         if self.current_area_id != area_id:
             self.current_area_id = area_id
             await self.send_msgs(
@@ -645,17 +628,8 @@ async def rabi_ribi_watcher(ctx: RabiRibiContext):
 
     :RabiRibiContext ctx: The Rabi Ribi Client context instance.
     """
-    logger.warning("LINUX DEBUG: watcher entered")
     watch_menu_task = None
-
-    logger.warning("LINUX DEBUG: waiting for initial connection info")
     await ctx.wait_for_initial_connection_info()
-    logger.warning("LINUX DEBUG: initial connection info received")
-    logger.warning(
-        "LINUX DEBUG: watcher past initial wait; slot=%r seed_player_id=%r",
-        ctx.slot,
-        ctx.seed_player_id,
-    )
     while not ctx.exit_event.is_set():
         if not ctx.server:
             # client disconnected from server
@@ -685,9 +659,7 @@ async def rabi_ribi_watcher(ctx: RabiRibiContext):
                 break
             if not ctx.server:
                 continue
-            logger.warning("LINUX DEBUG: before wait_until_out_of_shaft")
             await ctx.wait_until_out_of_shaft()
-            logger.warning("LINUX DEBUG: after wait_until_out_of_shaft")
 
             cur_time = time.time()
 
@@ -702,23 +674,13 @@ async def rabi_ribi_watcher(ctx: RabiRibiContext):
                 ctx.time_since_last_death = time.time()
                 await ctx.send_death(f"{ctx.player_names[ctx.slot]} was defeated...")
 
-            logger.warning("LINUX DEBUG: before handle_egg_changes")
             await ctx.handle_egg_changes()
-            logger.warning("LINUX DEBUG: after handle_egg_changes")
-
-            logger.warning("LINUX DEBUG: before check_for_locations")
             await check_for_locations(ctx)
-            logger.warning("LINUX DEBUG: after check_for_locations")
             await ctx.update_player_location()
 
             if ctx.in_state_where_should_open_warp_menu():
                 ctx.open_warp_menu()
 
-            logger.warning(
-                "LINUX DEBUG watcher reached; queued_ids=%s received_items=%s",
-                len(ctx.items_received_rabi_ribi_ids),
-                len(ctx.items_received),
-            )
             can_give = ctx.in_state_where_can_give_items()
             logger.warning(
                 "LINUX DEBUG: watcher checkpoint; can_give=%s queued_ids=%s last_index=%s",
@@ -768,29 +730,43 @@ async def rabi_ribi_watcher(ctx: RabiRibiContext):
             continue
         await asyncio.sleep(0.5)
 
-async def check_for_locations(ctx: RabiRibiContext):
-    """
-    This method checks if the player coordinates overlaps with any location checks.
-    If it is, it will update the locations_checked set to include the location
-    (if it's not already included).
-
-    :RabiRibiContext ctx: The Rabi Ribi Client context instance.
-    """
-    # Game paused or just got item
+async def check_for_locations(ctx):
     if ctx.rr_interface.is_in_item_receive_animation():
         ap_location_id, coordinates = ctx.find_closest_item_location()
-        if not ap_location_id:
-            return
-        if ap_location_id not in ctx.locations_checked:
-            ctx.locations_checked.add(ap_location_id)
-            await ctx.check_locations([ap_location_id])
 
-            # TODO: Remove this LocationScout when UT fixes issue with local item tracking
+        logger.warning(
+            "LINUX MAP DEBUG: closest_location=%s coordinates=%s",
+            ap_location_id,
+            coordinates,
+        )
+
+        if not ap_location_id:
+            logger.warning("LINUX MAP DEBUG: no matching location found")
+            return
+
+        if ap_location_id not in ctx.locations_checked:
+            logger.warning(
+                "LINUX MAP DEBUG: checking location ID %s",
+                ap_location_id,
+            )
+            ctx.locations_checked.add(ap_location_id)
+
+            logger.warning(
+                "LINUX MAP DEBUG: id=%s in_missing=%s missing_count=%s server_checked=%s",
+                ap_location_id,
+                ap_location_id in ctx.missing_locations,
+                len(ctx.missing_locations),
+                ap_location_id in ctx.checked_locations,
+            )
+            await ctx.check_locations([ap_location_id])
+            logger.warning(
+                "LINUX MAP DEBUG: location check call returned; checked_count=%s",
+                len(ctx.locations_checked),
+            )
             asyncio.create_task(ctx.send_msgs([{
                 "cmd": "LocationScouts",
                 "locations": [ap_location_id]
             }]))
-
             await remove_exclamation_point(ctx, coordinates)
 
 async def remove_exclamation_point(ctx: RabiRibiContext, coordinates):
@@ -814,15 +790,9 @@ async def main(args):
         ctx.run_gui()
     ctx.run_cli()
 
-    logger.warning("LINUX DEBUG: scheduling Rabi-Ribi watcher")
     watcher = asyncio.create_task(
         rabi_ribi_watcher(ctx),
         name="Rabi-Ribi Progression Watcher"
-    )
-    logger.warning(
-        "LINUX DEBUG: watcher scheduled; done=%s cancelled=%s",
-        watcher.done(),
-        watcher.cancelled(),
     )
     await ctx.exit_event.wait()
     await watcher
