@@ -121,6 +121,7 @@ class RabiRibiData:
             event_data: list[EventData],
             constraint_data: list[ConstraintData]):
         self.items = [item for item in item_data]
+        self._items_by_id = {item.id: item for item in self.items}
         self.locations = [location for location in location_data]
         self.regions = [region for region in region_data]
         self.events = [event for event in event_data]
@@ -200,6 +201,9 @@ class RabiRibiData:
 
     def get_constraint_by_logic_key(self, logic_key: str) -> ConstraintData:
         return self._logic_constraints[logic_key]
+
+    def get_item_by_id(self, item_id: int) -> ItemData:
+        return self._items_by_id[item_id]
 
     def get_item_ap_name(self, logic_key: str) -> str:
         return self._logic_items[logic_key].name

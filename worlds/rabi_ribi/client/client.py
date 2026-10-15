@@ -258,37 +258,56 @@ class RabiRibiContext(TrackerGameContext): # type: ignore
                 from worlds.rabi_ribi.client.patch import patch_map_files
                 patch_map_files(self)
 
+
     async def give_item(self):
         """
-        Give an item to the player. This method will always give the oldest
-        item that the player has recieved from AP, but not in game yet.
+        Give the oldest AP item that has not yet been processed.
+        Repeated upgradeable items are granted until their maximum state.
         """
-        # Find the first item ID that the player has not recieved yet
-        last_received_item_index = self.rr_interface.get_last_received_item_index()
-        remaining_items = self.items_received_rabi_ribi_ids[last_received_item_index:]
-        skipped_items, cur_item_id = next(((idx, item_id) for idx, item_id in enumerate(remaining_items) if item_id != -1), (-1, -1))
+        last_received_item_index = (
+            self.rr_interface.get_last_received_item_index()
+        )
+        remaining_items = self.items_received_rabi_ribi_ids[
+            last_received_item_index:
+        ]
+
+        skipped_items, cur_item_id = next(
+            (
+                (idx, item_id)
+                for idx, item_id in enumerate(remaining_items)
+                if item_id != -1
+            ),
+            (-1, -1),
+        )
 
         if cur_item_id > 0:
-            already_has_item = self.rr_interface.does_player_have_item_id(cur_item_id)
-            if not already_has_item:
-                print(
-                    f"[Linux item debug] attempting item ID {cur_item_id}",
-                    flush=True,
-                )
-                self.rr_interface.give_item(cur_item_id)                
-                print(
-                    f"[Linux item debug] give_item returned for ID {cur_item_id}",
-                    flush=True,
-                )
+            item = data.get_item_by_id(cur_item_id)
+            current_state = self.rr_interface.get_item_state(cur_item_id)
 
-            # Update index regardless to move to the next item in the queue
-            self.rr_interface.set_last_received_item_index(last_received_item_index + skipped_items + 1)
-            if not already_has_item:
+            # Negative states represent disabled items.
+            current_level = abs(current_state)
+            max_level = 1 + item.max_upgrades
+
+            if current_level < max_level:
+                print(
+                    f"[Linux item debug] attempting item ID {cur_item_id}; "
+                    f"state={current_state}, max={max_level}",
+                    flush=True,
+                )
+                self.rr_interface.give_item(cur_item_id)
                 await asyncio.sleep(1)
-            await self.wait_until_out_of_item_receive_animation()
-        elif len(remaining_items) > 0:
-            # Update index to mark the player as not waiting for Nothing items
-            self.rr_interface.set_last_received_item_index(last_received_item_index + len(remaining_items))
+                await self.wait_until_out_of_item_receive_animation()
+
+            self.rr_interface.set_last_received_item_index(
+                last_received_item_index + skipped_items + 1
+            )
+
+        elif remaining_items:
+            # Consume trailing Nothing entries.
+            self.rr_interface.set_last_received_item_index(
+                last_received_item_index + len(remaining_items)
+            )
+
 
     async def set_received_rabi_ribi_item_ids(self):
         logger.warning(

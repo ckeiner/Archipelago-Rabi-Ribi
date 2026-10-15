@@ -10,6 +10,7 @@ from pathlib import Path
 
 from CommonClient import logger
 from .privileged_game_memory import PrivilegedGameMemory
+from ..data import data
 
 
 # Keep these offsets synchronized with memory_io.py.
@@ -375,39 +376,33 @@ class RabiRibiMemoryIO:
                 "refusing to execute an unverified address."
             )
 
-
-        # if item_id not in DIRECT_INVENTORY_ITEM_IDS:
-        #     raise NotImplementedError(
-        #         f"Item ID {item_id} is not supported by the Linux "
-        #         "direct-inventory fallback. No item was delivered."
-        #     )
-
-        # Don't overwrite an existing state (including upgraded or disabled
-        # states). The client normally checks ownership before calling us.
         current_state = self.get_item_state(item_id)
-        if current_state != 0:
+
+        # Upgradeable items use inventory states 1, 2, and 3.
+        # Preserve the disabled state if the item is currently disabled.
+        item = data.get_item_by_id(item_id)
+        max_state = 1 + item.max_upgrades
+
+        if current_state == 0:
+            new_state = 1
+        elif current_state > 0:
+            new_state = min(current_state + 1, max_state)
+        elif current_state < 0:
+            new_state = -min(abs(current_state) + 1, max_state)
+        else:
             raise ProcessError(
-                f"Item ID {item_id} already has inventory state "
-                f"{current_state}; refusing to overwrite it."
+                f"Unexpected inventory state {current_state} for item {item_id}"
             )
 
-        self.set_item_state(item_id, 1)
+        self.set_item_state(item_id, new_state)
 
-        print(
-            f"[Linux item debug] item={item_id}, "
-            f"state_after_write={self.get_item_state(item_id)}, "
-            f"has_item={self.does_player_have_item_id(item_id)}",
-            flush=True,
-        )
-
-
-        # Verify the write before returning success to the receive loop.
         actual_state = self.get_item_state(item_id)
-        if actual_state != 1:
+        if actual_state != new_state:
             raise ProcessError(
-                f"Inventory write for item ID {item_id} did not verify "
-                f"(read back {actual_state})."
+                f"Failed to update item {item_id}: expected state "
+                f"{new_state}, got {actual_state}"
             )
+
         return
 
 
