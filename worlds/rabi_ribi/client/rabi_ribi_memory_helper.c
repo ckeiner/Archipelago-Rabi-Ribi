@@ -71,7 +71,8 @@ static int game_mapping(pid_t pid) {
             &start, &end, perms, &offset,
             device, &inode, mapped
         );
-        if (fields != 7 || offset != 0) continue;
+        if (fields != 7 || offset != 0)
+            continue;
 
         char *p = mapped;
         while (*p == ' ' || *p == '\t') ++p;
@@ -90,7 +91,10 @@ static int game_mapping(pid_t pid) {
 
 static int permitted_range(pid_t pid, unsigned long long addr,
                            size_t len, int writing) {
-    if (!len || len > MAX_TRANSFER || addr > ULLONG_MAX - len)
+    if (!len ||
+        len > MAX_TRANSFER ||
+        addr > UINT32_MAX ||
+        len > 0x100000000ULL - addr)
         return 0;
 
     char path[64], line[8192], perms[5];
@@ -113,42 +117,42 @@ static int permitted_range(pid_t pid, unsigned long long addr,
     return ok;
 }
 
+
 int main(int argc, char **argv) {
-    if (geteuid() != 0 || argc != 2) {
-        fprintf(stderr, "Must be launched through sudo with a PID.\n");
+    if (argc != 2) {
+        fprintf(stderr, "Usage: rabi-ribi-memory-helper PID\n");
         return 2;
     }
 
-    const char *sudo_uid = getenv("SUDO_UID");
-    char *uid_end = NULL;
-    errno = 0;
-    unsigned long invoking_uid = sudo_uid
-        ? strtoul(sudo_uid, &uid_end, 10)
-        : ULONG_MAX;
+    uid_t invoking_uid = getuid();
 
-    if (errno || !sudo_uid || !*sudo_uid ||
-        !uid_end || *uid_end || invoking_uid == 0 ||
-        invoking_uid > UINT_MAX) {
-        fprintf(stderr, "Missing or invalid SUDO_UID.\n");
+    if (invoking_uid == 0) {
+        fprintf(stderr, "Run as a normal user, not root.\n");
         return 2;
     }
 
     char *end = NULL;
+    errno = 0;
     long p = strtol(argv[1], &end, 10);
-    if (!end || *end || p <= 1 || p > INT_MAX) {
+
+    if (errno || !end || *end || p <= 1 || p > INT_MAX) {
         fprintf(stderr, "Invalid PID.\n");
         return 2;
     }
+
     pid_t pid = (pid_t)p;
 
-    if (!same_uid(pid, (uid_t)invoking_uid) ||
-        !game_cmdline(pid) || !game_mapping(pid)) {
-        fprintf(stderr, "Target rejected: not this user's Rabi-Ribi process.\n");
+    if (!same_uid(pid, invoking_uid) ||
+        !game_cmdline(pid) ||
+        !game_mapping(pid)) {
+        fprintf(stderr,
+                "Target rejected: not this user's Rabi-Ribi process.\n");
         return 2;
     }
 
     char path[64];
     snprintf(path, sizeof(path), "/proc/%ld/mem", (long)pid);
+
     int mem = open(path, O_RDWR | O_CLOEXEC);
     if (mem < 0) {
         perror("open target memory");
@@ -157,13 +161,20 @@ int main(int argc, char **argv) {
 
     char *line = NULL;
     size_t capacity = 0;
+
     puts("READY");
     fflush(stdout);
 
-    while (getline(&line, &capacity, stdin) != -1) {
+    ssize_t line_length;
+
+    while ((line_length = getline(&line, &capacity, stdin)) != -1) {
+        if (line_length > 2 * MAX_TRANSFER + 128) {
+            puts("ERR command-too-long");
+            fflush(stdout);
+            continue;
+        }
+
         char op;
-        unsigned long long addr;
-        size_t len;
 
         if (sscanf(line, " %c", &op) != 1) {
             puts("ERR bad-command");
@@ -178,8 +189,12 @@ int main(int argc, char **argv) {
         }
 
         if (op == 'R') {
+            unsigned long long addr;
+            size_t len;
             char extra;
-            if (sscanf(line, " R %llx %zu %c", &addr, &len, &extra) != 2 ||
+
+            if (sscanf(line, " R %llx %zu %c",
+                       &addr, &len, &extra) != 2 ||
                 !permitted_range(pid, addr, len, 0)) {
                 puts("ERR invalid-read");
                 fflush(stdout);
@@ -187,21 +202,27 @@ int main(int argc, char **argv) {
             }
 
             unsigned char data[MAX_TRANSFER];
+
             if (pread(mem, data, len, (off_t)addr) != (ssize_t)len) {
                 puts("ERR read-failed");
                 fflush(stdout);
                 continue;
             }
+
             printf("OK ");
-            for (size_t i = 0; i < len; ++i)
+            for (size_t i = 0; i < len; ++i) {
                 printf("%02x", data[i]);
+            }
             putchar('\n');
             fflush(stdout);
             continue;
         }
 
         if (op == 'W') {
-            char address_text[32], hex[MAX_TRANSFER * 2 + 2], extra;
+            char address_text[32];
+            char hex[MAX_TRANSFER * 2 + 2];
+            char extra;
+
             if (sscanf(line, " W %31s %8193s %c",
                        address_text, hex, &extra) != 2) {
                 puts("ERR bad-write");
@@ -210,15 +231,21 @@ int main(int argc, char **argv) {
             }
 
             errno = 0;
-            addr = strtoull(address_text, &end, 16);
+            unsigned long long addr =
+                strtoull(address_text, &end, 16);
+
             if (errno || !end || *end) {
                 puts("ERR bad-address");
                 fflush(stdout);
                 continue;
             }
 
-            len = strlen(hex) / 2;
-            if (!len || len > MAX_TRANSFER || strlen(hex) != len * 2 ||
+            size_t hex_len = strlen(hex);
+            size_t len = hex_len / 2;
+
+            if (!len ||
+                len > MAX_TRANSFER ||
+                hex_len != len * 2 ||
                 !permitted_range(pid, addr, len, 1)) {
                 puts("ERR invalid-write");
                 fflush(stdout);
@@ -227,22 +254,27 @@ int main(int argc, char **argv) {
 
             unsigned char data[MAX_TRANSFER];
             int valid = 1;
+
             for (size_t i = 0; i < len; ++i) {
                 unsigned int value;
-                if (!isxdigit((unsigned char)hex[2*i]) ||
-                    !isxdigit((unsigned char)hex[2*i+1]) ||
-                    sscanf(hex + 2*i, "%2x", &value) != 1) {
+
+                if (!isxdigit((unsigned char)hex[2 * i]) ||
+                    !isxdigit((unsigned char)hex[2 * i + 1]) ||
+                    sscanf(hex + 2 * i, "%2x", &value) != 1) {
                     valid = 0;
                     break;
                 }
+
                 data[i] = (unsigned char)value;
             }
 
-            if (!valid || pwrite(mem, data, len, (off_t)addr) != (ssize_t)len) {
+            if (!valid ||
+                pwrite(mem, data, len, (off_t)addr) != (ssize_t)len) {
                 puts("ERR write-failed");
                 fflush(stdout);
                 continue;
             }
+
             printf("OK %zu\n", len);
             fflush(stdout);
             continue;
@@ -256,3 +288,4 @@ int main(int argc, char **argv) {
     close(mem);
     return 0;
 }
+

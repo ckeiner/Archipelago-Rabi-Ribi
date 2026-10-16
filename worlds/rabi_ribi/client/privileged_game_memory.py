@@ -5,7 +5,6 @@ class PrivilegedGameMemory:
     def __init__(self, pid: int):
         self.process = subprocess.Popen(
             [
-                "sudo", "-n",
                 "/usr/local/libexec/rabi-ribi-memory-helper",
                 str(pid),
             ],
